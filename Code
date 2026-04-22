@@ -1,1 +1,143 @@
+import torch
+import torch.nn as nn
+import einops
+from torch.autograd import Function
 
+# --- Gradient Reversal Layer for Adversarial Training ---
+class ReverseLayerF(Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        output = grad_output.neg() * ctx.alpha
+        return output, None
+
+# --- KAN-based Classifier Block (Original LN_G_9) ---
+class KANClassifierBlock(nn.Module):
+    def __init__(self, num_groups=8, num_channels=16, num_classes=40):
+        super().__init__()
+        self.norm = nn.GroupNorm(num_groups, num_channels)
+        self.proj = nn.Linear(16 * 4, 40)
+        self.kan1 = KAN([16 * 4, 16 * 4])
+        self.kan2 = KAN([16 * 4, 40])
+        self.linear1 = nn.Linear(80, 60)
+        self.linear2 = nn.Linear(60, num_classes)
+        self.drop = nn.Dropout(0.2)
+
+    def forward(self, x):
+        x_raw = x.flatten(1)
+        # Group Normalization branch
+        x_norm = self.norm(x)
+        x_norm = x_norm.flatten(1)
+        x_norm = self.proj(x_norm)
+        # KAN branch
+        x_kan = self.kan1(x_raw)
+        x_kan = self.kan2(x_kan)
+        # Concatenate and Output
+        x_combined = torch.cat((x_norm, x_kan), dim=-1)
+        x_out = self.linear1(x_combined)
+        x_out = self.linear2(x_out)
+        return x_out
+
+# --- Category Classifier Wrapper ---
+class CategoryClassifier(nn.Module):
+    def __init__(self, n_classes):
+        super(CategoryClassifier, self).__init__()
+        self.net = KANClassifierBlock(num_groups=8, num_channels=16, num_classes=n_classes)
+
+    def forward(self, x):
+        return self.net(x)
+
+# --- Domain Discriminator Wrapper ---
+class DomainDiscriminator(nn.Module):
+    def __init__(self, num_classes):
+        super(DomainDiscriminator, self).__init__()
+        self.net = KANClassifierBlock(num_groups=8, num_channels=16, num_classes=num_classes)
+        self.sig = nn.Sigmoid()
+
+    def forward(self, x):
+        x = self.net(x)
+        return self.sig(x)
+
+# --- Feature Extractor (Original EEGNet_15_NoLinear) ---
+class FeatureExtractor(nn.Module):
+    def __init__(self, n_classes=4, channels=60, samples=151, dropoutRate=0.5,
+                 kernelLength=64, kernelLength2=16, F1=8, D=2, F2=16):
+        super(FeatureExtractor, self).__init__()
+        self.channels = channels
+        
+        # Block 1: Temporal & Depthwise Conv
+        self.conv1 = nn.Conv2d(1, F1, (1, kernelLength), padding=(0, kernelLength // 2), bias=False)
+        self.bn1 = nn.BatchNorm2d(F1, momentum=0.01, eps=1e-3)
+        self.dw_conv = nn.Conv2d(F1, F1 * D, (channels, 1), groups=F1, bias=False)
+        self.bn2 = nn.BatchNorm2d(F1 * D, momentum=0.01, eps=1e-3)
+        self.elu = nn.ELU()
+        self.pool1 = nn.AvgPool2d((1, 4), stride=4)
+        self.drop1 = nn.Dropout(dropoutRate)
+
+        # Block 2: Separable Conv
+        self.sep_conv_dw = nn.Conv2d(F1 * D, F1 * D, (1, kernelLength2), padding=(0, kernelLength2 // 2), groups=F1 * D, bias=False)
+        self.sep_conv_pw = nn.Conv2d(F1 * D, F2, 1, 1)
+        self.bn3 = nn.BatchNorm2d(F2, momentum=0.01, eps=1e-3)
+        self.pool2 = nn.AvgPool2d((1, 8), stride=8)
+        self.drop2 = nn.Dropout(dropoutRate)
+
+        # Attention and Normalization
+        self.atten = SpatialAttention(kernel_size=7)
+        self.input_bn = nn.BatchNorm2d(1)
+
+    def forward(self, x):
+        x = x[:, :self.channels, :]
+        x = einops.rearrange(x, 'b c t -> b 1 c t')
+        x = self.input_bn(x)
+
+        # Block 1
+        x = self.bn1(self.conv1(x))
+        x = self.dw_conv(x)
+        with torch.no_grad(): # Weight constraint
+            self.dw_conv.weight.data = torch.renorm(self.dw_conv.weight.data, p=2, dim=0, maxnorm=1)
+        x = self.drop1(self.pool1(self.elu(self.bn2(x))))
+
+        # Block 2 with Attention
+        x = self.sep_conv_pw(self.sep_conv_dw(x))
+        x = self.atten(x) * x
+        x = self.drop2(self.pool2(self.elu(self.bn3(x))))
+        return x
+
+# --- CNDNet: Main Model (Original Six_Net_2) ---
+class CNDNet(nn.Module):
+    def __init__(self, n_classes=40, channels=128, samples=125):
+        super(CNDNet, self).__init__()
+        self.feature_extractor = FeatureExtractor(n_classes=n_classes, channels=channels, samples=samples)
+        
+        # Dual Category Classifiers
+        self.class_per = CategoryClassifier(n_classes)
+        self.class_img = CategoryClassifier(n_classes)
+
+        # Domain Discriminator
+        self.domain = DomainDiscriminator(1)
+
+    def forward(self, x, alpha):
+        # Split input into Perception and Imagery domains
+        x_per = x[:, :128, :]
+        x_img = x[:, 128:, :]
+
+        # Feature extraction
+        feat_per = self.feature_extractor(x_per)
+        feat_img = self.feature_extractor(x_img)
+
+        # Semantic classification
+        out_per = self.class_per(feat_per)
+        out_img = self.class_img(feat_img)
+
+        # Domain discrimination with GRL
+        feat_per_rev = ReverseLayerF.apply(feat_per, alpha)
+        feat_img_rev = ReverseLayerF.apply(feat_img, alpha)
+        
+        domain_per = self.domain(feat_per_rev)
+        domain_img = self.domain(feat_img_rev)
+
+        return out_per, out_img, domain_per, domain_img
